@@ -39,7 +39,7 @@
 //===----------------------------------------------------------------------===//
 
 #define GET_INSTRINFO_CTOR_DTOR
-#include "../TableGen/LX32GenInstrInfo.inc"
+#include "LX32GenInstrInfo.inc"
 
 using namespace llvm;
 
@@ -227,15 +227,29 @@ bool LX32InstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
         continue;
       RegOps.push_back(MO);
     }
-    if (RegOps.size() < 2)
+    if (RegOps.empty())
       report_fatal_error("lx32: malformed conditional-branch pseudo operands");
-    if (!TargetMBBOp)
+    if (RegOps.size() == 1)
+      // Compare-against-zero forms may surface as a single explicit register
+      // plus an omitted `$noreg` operand after ISel.
+      RegOps.insert(RegOps.begin(), MachineOperand::CreateReg(LX32::X0, false));
+    MachineBasicBlock *TargetMBB = nullptr;
+    if (TargetMBBOp)
+      TargetMBB = TargetMBBOp->getMBB();
+    else if (!MBB.succ_empty())
+      // ISel may leave branch pseudos without an explicit MBB operand.
+      // In that case, keep the first CFG successor as the conditional edge.
+      TargetMBB = *MBB.succ_begin();
+
+    if (!TargetMBB)
       report_fatal_error("lx32: conditional branch pseudo missing target MBB");
 
     auto MIB = BuildMI(MBB, MI, DL, get(RealOpc));
-    MIB->addOperand(RegOps[RegOps.size() - 2]);
-    MIB->addOperand(RegOps[RegOps.size() - 1]);
-    MIB->addOperand(*TargetMBBOp);
+    // Standard RISC-V: rs1 is operand A (src_a), rs2 is operand B (src_b).
+    // BLT branches if rs1 < rs2. branch_unit.sv confirms this ordering.
+    MIB->addOperand(RegOps[0]);  // rs1
+    MIB->addOperand(RegOps[1]);  // rs2
+    MIB.addMBB(TargetMBB);
     MBB.erase(MI);
     return true;
   };
@@ -258,6 +272,18 @@ bool LX32InstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
     MBB.erase(MI);
     return true;
 
+  case LX32::PseudoINDIRECTCALL:
+    // Expand to: JALR ra, 0(rs1)
+    //   X1 (ra, define)  — return address is stored in ra (X1).
+    //   rs1              — the function address from operand 0.
+    //   0                — no offset.
+    BuildMI(MBB, MI, DL, get(LX32::JALR))
+        .addReg(LX32::X1, RegState::Define)
+        .addReg(MI.getOperand(0).getReg())
+        .addImm(0);
+    MBB.erase(MI);
+    return true;
+
   case LX32::PseudoBR: {
     // Expand to: JAL x0, target
     //   x0 (define, dead) — result register; we discard the PC+4 return address
@@ -274,9 +300,18 @@ bool LX32InstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
     }
 
     if (CondTarget) {
+      // In a canonical cond-then-uncond block, the unconditional edge should
+      // be the layout fallthrough when no explicit MBB operand survives.
+      if (!TargetMBB)
+        if (MachineBasicBlock *LayoutNext = MBB.getNextNode())
+          if (LayoutNext != CondTarget && LayoutNext != &MBB)
+            TargetMBB = LayoutNext;
+
       MachineBasicBlock *OtherSucc = nullptr;
       for (MachineBasicBlock *Succ : MBB.successors()) {
         if (Succ == CondTarget)
+          continue;
+        if (Succ == &MBB)
           continue;
         if (!OtherSucc) {
           OtherSucc = Succ;
@@ -287,6 +322,12 @@ bool LX32InstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
       }
       if (OtherSucc)
         TargetMBB = OtherSucc;
+    }
+
+    if (!TargetMBB) {
+      if (MachineBasicBlock *LayoutNext = MBB.getNextNode())
+        if (LayoutNext != &MBB)
+          TargetMBB = LayoutNext;
     }
 
     if (!TargetMBB) {

@@ -22,12 +22,44 @@
 //   Section 10  — Constant-materialization patterns
 //   Section 11  — Pseudo-instructions
 //   Section 12  — Codegen-only pseudo overrides (stack adjustment, guards)
+//   Section 13  — Custom Instructions (PULSAR)
 //
 //===----------------------------------------------------------------------===//
 
 //===----------------------------------------------------------------------===//
 // Section 0 — Custom SDNodes and Pattern Fragments
 //===----------------------------------------------------------------------===//
+
+def SDT_LX32Sensor : SDTypeProfile<1, 1, [SDTCisVT<0, i32>, SDTCisVT<1, i32>]>;
+def LX32sensor : SDNode<"LX32ISD::LX32_SENSOR", SDT_LX32Sensor>;
+def LX32matrix : SDNode<"LX32ISD::LX32_MATRIX", SDT_LX32Sensor>;
+def LX32delta  : SDNode<"LX32ISD::LX32_DELTA", SDT_LX32Sensor>;
+def LX32chord  : SDNode<"LX32ISD::LX32_CHORD", SDT_LX32Sensor>;
+
+def SDT_LX32Wait : SDTypeProfile<0, 1, [SDTCisVT<0, i32>]>;
+
+def LX32wait : SDNode<"LX32ISD::LX32_WAIT", SDT_LX32Wait,
+                      [SDNPHasChain, SDNPSideEffect]>;
+
+
+def SDT_LX32Report : SDTypeProfile<0, 1, [SDTCisVT<0, i32>]>;
+
+def LX32report : SDNode<"LX32ISD::LX32_REPORT", SDT_LX32Report,
+                        [SDNPHasChain, SDNPSideEffect, SDNPMayStore]>;
+
+// LX32select_cc — conditional select with explicit condition code.
+//
+// Produced by lowerSELECT / lowerSELECT_CC.
+// Operand order: (lhs, rhs, truev, falsev, cc_as_i32_imm).
+// The condition code is stored as an integer constant (ISD::CondCode enum).
+// PseudoSELECT_CC matches this and is expanded post-RA by
+// EmitInstrWithCustomInserter into a branch diamond.
+def SDT_LX32SelectCC : SDTypeProfile<1, 5, [
+    SDTCisSameAs<1, 2>,   // lhs and rhs have the same type (comparison operands)
+    SDTCisSameAs<0, 3>,   // result has the same type as truev
+    SDTCisSameAs<3, 4>,   // truev and falsev have the same type
+    SDTCisVT<5, i32>]>;   // cc is an i32 integer constant (ISD::CondCode enum)
+def LX32select_cc : SDNode<"LX32ISD::SELECT_CC", SDT_LX32SelectCC>;
 
 // LX32ret — custom DAG node for the LX32 return sequence.
 //
@@ -40,6 +72,13 @@ def SDT_LX32Ret : SDTypeProfile<0, 0, []>;
 def LX32ret : SDNode<"LX32ISD::RET", SDT_LX32Ret,
                      [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
 
+// BRCC node used by custom BR_CC lowering.
+// Operand order in patterns is (lhs, rhs, cond, target), with chain implicit.
+def SDT_LX32BrCC : SDTypeProfile<0, 4, [SDTCisSameAs<0, 1>,
+                                        SDTCisVT<2, OtherVT>,
+                                        SDTCisVT<3, OtherVT>]>;
+def LX32brcc : SDNode<"LX32ISD::BRCC", SDT_LX32BrCC, [SDNPHasChain]>;
+
 // Load pattern fragments — model sign- and zero-extending sub-word loads.
 // These wrap the generic LLVM load nodes so that the instruction patterns
 // in Section 5 can match them with a single, readable name.
@@ -47,6 +86,18 @@ def lx32_lh  : PatFrag<(ops node:$ptr), (i32 (sextloadi16 node:$ptr))>;
 def lx32_lhu : PatFrag<(ops node:$ptr), (i32 (zextloadi16 node:$ptr))>;
 def lx32_lb  : PatFrag<(ops node:$ptr), (i32 (sextloadi8  node:$ptr))>;
 def lx32_lbu : PatFrag<(ops node:$ptr), (i32 (zextloadi8  node:$ptr))>;
+
+// AddrFI — ComplexPattern that matches an ISD::FrameIndex address node.
+//
+// When the instruction selector (top-down) processes a load/store before its
+// FrameIndex address operand, the address is still an unselected FrameIndex.
+// Using a ComplexPattern lets the pattern-matching logic call selectAddrFI(),
+// which converts ISD::FrameIndex → ISD::TargetFrameIndex at match time.
+//
+// The resulting TargetFrameIndex is stored as MO_FrameIndex in the emitted
+// machine instruction and resolved to (sp/fp + concrete_offset) by
+// LX32RegisterInfo::eliminateFrameIndex after the frame layout is finalised.
+def AddrFI : ComplexPattern<i32, 1, "selectAddrFI", [frameindex], []>;
 
 //===----------------------------------------------------------------------===//
 // Section 0.5 — Operand Transformers
@@ -304,7 +355,58 @@ def SB : Store_Pat<0b000, "sb",
 // Additional addressing patterns for pointer-dereference IR where the address
 // node is already a plain base register and no explicit add-immediate appears.
 def : Pat<(load GPR:$rs1), (LW GPR:$rs1, 0)>;
+def : Pat<(lx32_lh GPR:$rs1), (LH GPR:$rs1, 0)>;
+def : Pat<(lx32_lhu GPR:$rs1), (LHU GPR:$rs1, 0)>;
+def : Pat<(lx32_lb GPR:$rs1), (LB GPR:$rs1, 0)>;
+def : Pat<(lx32_lbu GPR:$rs1), (LBU GPR:$rs1, 0)>;
 def : Pat<(store GPR:$rs2, GPR:$rs1), (SW GPR:$rs2, GPR:$rs1, 0)>;
+def : Pat<(truncstorei16 GPR:$rs2, GPR:$rs1), (SH GPR:$rs2, GPR:$rs1, 0)>;
+def : Pat<(truncstorei8  GPR:$rs2, GPR:$rs1), (SB GPR:$rs2, GPR:$rs1, 0)>;
+
+// EXTLOAD patterns — LLVM emits ISD::EXTLOAD when the sign vs. zero extension
+// of narrow memory does not matter (upper bits are unused).  Map to LBU/LHU
+// (zero-extension) since the upper bits are undefined in either case.
+def : Pat<(extloadi8  GPR:$rs1), (LBU GPR:$rs1, 0)>;
+def : Pat<(extloadi16 GPR:$rs1), (LHU GPR:$rs1, 0)>;
+def : Pat<(extloadi8  (add GPR:$rs1, imm12:$imm12)), (LBU GPR:$rs1, imm12:$imm12)>;
+def : Pat<(extloadi16 (add GPR:$rs1, imm12:$imm12)), (LHU GPR:$rs1, imm12:$imm12)>;
+
+// FrameIndex-addressed loads and stores.
+//
+// LLVM's instruction selector visits nodes top-down (root first).  When a
+// load/store addresses a stack slot (ISD::FrameIndex), the FrameIndex child
+// has not yet been selected when the parent load/store is visited.  Without
+// these patterns, SelectCode cannot match GPR:$rs1 against an unselected
+// FrameIndex node, causing a "Cannot select" fatal error.
+//
+// The AddrFI PatFrag (Section 0) matches ISD::FrameIndex nodes.  The
+// generated machine instruction carries a MO_FrameIndex operand which
+// LX32RegisterInfo::eliminateFrameIndex later resolves to (sp + offset).
+//
+// A standalone FrameIndex (address-of a stack variable, not embedded in a
+// load/store) is handled by the final pattern which materialises it via ADDI.
+def : Pat<(load AddrFI:$rs1), (LW AddrFI:$rs1, 0)>;
+def : Pat<(load (add AddrFI:$rs1, imm12:$imm12)), (LW AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(lx32_lh  AddrFI:$rs1), (LH  AddrFI:$rs1, 0)>;
+def : Pat<(lx32_lh  (add AddrFI:$rs1, imm12:$imm12)), (LH  AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(lx32_lhu AddrFI:$rs1), (LHU AddrFI:$rs1, 0)>;
+def : Pat<(lx32_lhu (add AddrFI:$rs1, imm12:$imm12)), (LHU AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(lx32_lb  AddrFI:$rs1), (LB  AddrFI:$rs1, 0)>;
+def : Pat<(lx32_lb  (add AddrFI:$rs1, imm12:$imm12)), (LB  AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(lx32_lbu AddrFI:$rs1), (LBU AddrFI:$rs1, 0)>;
+def : Pat<(lx32_lbu (add AddrFI:$rs1, imm12:$imm12)), (LBU AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(extloadi8  AddrFI:$rs1), (LBU AddrFI:$rs1, 0)>;
+def : Pat<(extloadi8  (add AddrFI:$rs1, imm12:$imm12)), (LBU AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(extloadi16 AddrFI:$rs1), (LHU AddrFI:$rs1, 0)>;
+def : Pat<(extloadi16 (add AddrFI:$rs1, imm12:$imm12)), (LHU AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(store GPR:$rs2, AddrFI:$rs1), (SW GPR:$rs2, AddrFI:$rs1, 0)>;
+def : Pat<(store GPR:$rs2, (add AddrFI:$rs1, imm12:$imm12)), (SW GPR:$rs2, AddrFI:$rs1, imm12:$imm12)>;
+def : Pat<(truncstorei16 GPR:$rs2, AddrFI:$rs1), (SH GPR:$rs2, AddrFI:$rs1, 0)>;
+def : Pat<(truncstorei8  GPR:$rs2, AddrFI:$rs1), (SB GPR:$rs2, AddrFI:$rs1, 0)>;
+
+// Standalone FrameIndex: materialise the stack-slot address into a register.
+// Emits ADDI rd, FrameIndex, 0; eliminateFrameIndex converts to ADDI rd, sp, offset.
+def : Pat<(i32 AddrFI:$fi), (ADDI AddrFI:$fi, 0)>;
 
 //===----------------------------------------------------------------------===//
 // Section 7 — Branch Instructions (B-type)
@@ -404,15 +506,21 @@ let hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
 //     HI20 and LO12 (Section 0.5) compute the two pieces.  LO12 produces a
 //     sign-extended 12-bit value so that ADDI receives a valid simm12.
 //
-// TODO (Day 10): when LO12 == 0, this pattern emits "ADDI rd, rd, 0" which
-//   is a no-op.  The ISelDAGToDAG pass (Day 10) will suppress that case in
-//   C++ to avoid the redundant instruction.
+// Constant materialization patterns.
+//
+// Small constant: fits directly in the ADDI immediate field.
+// Large constant: upper 20 bits via LUI, lower 12 bits via ADDI.
+//
+// When LO12 == 0 the ADDI below would be a no-op (ADDI rd, rd, 0).
+// LX32ISelDAGToDAG::Select() intercepts ISD::Constant nodes before reaching
+// these patterns and emits only LUI in that case, saving one instruction.
 //===----------------------------------------------------------------------===//
 
 // Small constant: fits directly in the ADDI immediate field.
 def : Pat<(i32 imm12:$imm), (ADDI X0, imm12:$imm)>;
 
 // Large constant: upper 20 bits via LUI, lower 12 bits via ADDI.
+// (The ISelDAGToDAG pass suppresses this pattern when LO12 == 0.)
 def : Pat<(i32 imm:$imm), (ADDI (LUI (HI20 imm:$imm)), (LO12 imm:$imm))>;
 
 //===----------------------------------------------------------------------===//
@@ -459,12 +567,12 @@ let isPseudo = 1, hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
     let isReturn    = 1;
     let isTerminator = 1;
     let isBarrier   = 1;
-    // Keep return-value registers live across RA so return-copy chains are not
-    // deleted as dead defs before pseudo expansion.
-    let Uses        = [X1, X10, X11];
+    // Keep ra and primary integer return register live at function exit.
+    let Uses        = [X1, X10];
   }
 
-  def PseudoBR : LX32Pseudo<(outs), (ins simm21:$target), "br\t$target", []> {
+  def PseudoBR : LX32Pseudo<(outs), (ins simm21:$target), "br\t$target",
+                             [(br bb:$target)]> {
     let isTerminator = 1;
     let isBranch     = 1;
     let isBarrier    = 1;
@@ -472,7 +580,24 @@ let isPseudo = 1, hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
 
   def PseudoCALL : LX32Pseudo<(outs), (ins bare_symbol:$target), "call\t$target", []> {
     let isCall         = 1;
+    // Declare argument registers as live-in so the RA does not eliminate
+    // the pre-call CopyToReg instructions that load the arguments.
+    let Uses           = [X10, X11, X12, X13, X14, X15, X16, X17];
     // Model ABI caller-saved clobbers so RA spills/reloads across calls.
+    let Defs           = [X1, X5, X6, X7,
+                          X10, X11, X12, X13, X14, X15, X16, X17,
+                          X28, X29, X30, X31];
+    let hasSideEffects = 1;
+  }
+
+  // PseudoINDIRECTCALL — indirect call through a function-pointer register.
+  //   Expanded by expandPostRAPseudo to: JALR X1, 0(rs1)
+  //   Used when the call target is not a compile-time-known symbol (e.g. Rust
+  //   trait object dispatch, function pointers, or runtime-computed addresses).
+  def PseudoINDIRECTCALL : LX32Pseudo<(outs), (ins GPR:$rs1),
+                                        "# PseudoINDIRECTCALL $rs1", []> {
+    let isCall         = 1;
+    let Uses           = [X10, X11, X12, X13, X14, X15, X16, X17];
     let Defs           = [X1, X5, X6, X7,
                           X10, X11, X12, X13, X14, X15, X16, X17,
                           X28, X29, X30, X31];
@@ -484,7 +609,39 @@ let isPseudo = 1, hasSideEffects = 0, mayLoad = 0, mayStore = 0 in {
 
   def PseudoNOP : LX32Pseudo<(outs), (ins), "nop", []>;
 
+  // PseudoSELECT_CC — conditional select, expanded post-RA into a branch diamond.
+  //
+  // Operands: lhs, rhs, cc_as_imm, trueval, falseval → dst
+  // The condition code is stored as an integer immediate (ISD::CondCode enum value).
+  // EmitInstrWithCustomInserter in LX32ISelLowering.cpp expands this pseudo.
+  let usesCustomInserter = 1 in
+  def PseudoSELECT_CC : LX32Pseudo<(outs GPR:$dst),
+                                    (ins GPR:$lhs, GPR:$rhs, i32imm:$cc,
+                                         GPR:$truev, GPR:$falsev),
+                                    "pseudoselect_cc", []>;
+
 } // isPseudo = 1
+
+// Match LX32ISD::SELECT_CC to PseudoSELECT_CC.
+// The condition code is an i32 integer constant (ISD::CondCode enum value).
+def : Pat<(LX32select_cc (i32 GPR:$lhs), (i32 GPR:$rhs),
+                          (i32 GPR:$truev), (i32 GPR:$falsev), (i32 imm:$cc)),
+          (PseudoSELECT_CC GPR:$lhs, GPR:$rhs, imm:$cc,
+                            GPR:$truev, GPR:$falsev)>;
+
+// SETCC patterns for conditions not directly handled by SLT/SLTU.
+// These use XOR/XORI/SLTIU idioms identical to RISC-V.
+def : Pat<(setne  GPR:$rs1, GPR:$rs2), (SLTU  X0,           (XOR  GPR:$rs1, GPR:$rs2))>;
+def : Pat<(seteq  GPR:$rs1, GPR:$rs2), (SLTIU (XOR  GPR:$rs1, GPR:$rs2), 1)>;
+def : Pat<(setgt  GPR:$rs1, GPR:$rs2), (SLT   GPR:$rs2,     GPR:$rs1)>;
+def : Pat<(setugt GPR:$rs1, GPR:$rs2), (SLTU  GPR:$rs2,     GPR:$rs1)>;
+def : Pat<(setge  GPR:$rs1, GPR:$rs2), (XORI  (SLT  GPR:$rs1, GPR:$rs2), 1)>;
+def : Pat<(setle  GPR:$rs1, GPR:$rs2), (XORI  (SLT  GPR:$rs2, GPR:$rs1), 1)>;
+def : Pat<(setuge GPR:$rs1, GPR:$rs2), (XORI  (SLTU GPR:$rs1, GPR:$rs2), 1)>;
+def : Pat<(setule GPR:$rs1, GPR:$rs2), (XORI  (SLTU GPR:$rs2, GPR:$rs1), 1)>;
+// Zero-comparison shortcuts (common for booleans and null checks).
+def : Pat<(setne  GPR:$rs1, 0), (SLTU  X0, GPR:$rs1)>;
+def : Pat<(seteq  GPR:$rs1, 0), (SLTIU GPR:$rs1, 1)>;
 
 //===----------------------------------------------------------------------===//
 // Section 12 — Codegen-Only Pseudo Overrides
@@ -560,3 +717,161 @@ let isPseudo = 1, isCodeGenOnly = 1, Namespace = "LX32" in {
   }
 
 } // isPseudo = 1, isCodeGenOnly = 1
+
+// Match LX32 custom BRCC nodes to conditional branch pseudos.
+multiclass LX32BccPat<CondCode Cond, Instruction Inst> {
+  def : Pat<(LX32brcc (i32 GPR:$rs1), GPR:$rs2, Cond, bb:$target),
+            (Inst GPR:$rs1, GPR:$rs2, bb:$target)>;
+  // Make compare-against-zero explicit to avoid relying on late coalescing.
+  def : Pat<(LX32brcc (i32 GPR:$rs1), 0, Cond, bb:$target),
+            (Inst GPR:$rs1, (i32 X0), bb:$target)>;
+}
+
+defm : LX32BccPat<SETEQ, PseudoBEQ>;
+defm : LX32BccPat<SETNE, PseudoBNE>;
+defm : LX32BccPat<SETLT, PseudoBLT>;
+defm : LX32BccPat<SETGE, PseudoBGE>;
+defm : LX32BccPat<SETULT, PseudoBLTU>;
+defm : LX32BccPat<SETUGE, PseudoBGEU>;
+
+//===----------------------------------------------------------------------===//
+// Section 13 — Custom Instructions (PULSAR)
+//
+// These instructions occupy the CUSTOM-0 (0x0B) and CUSTOM-1 (0x2B) opcode
+// spaces reserved by the RISC-V ISA specification for non-standard extensions.
+//
+// CUSTOM-0 — sensor subsystem reads; funct3 selects the operation:
+//
+//   funct3  Mnemonic    Format   Semantics
+//   ------  ----------  -------  -----------------------------------------
+//   000     LX.SENSOR   I-type   rd = sign_extend_16(snapshot[rs1 & 0x3F])
+//   001     LX.MATRIX   I-type   rd = base_addr(snapshot_buffer)
+//   010     LX.DELTA    I-type   rd = sign_extend_16(cur[rs1] - prev[rs1])
+//   011     LX.CHORD    R-type   rd = ((active_keys & rs1) == rs1) ? 1 : 0
+//
+// CUSTOM-1 — pipeline control and DMA; funct3 selects the operation:
+//
+//   funct3  Mnemonic    Format   Semantics
+//   ------  ----------  -------  -----------------------------------------
+//   000     LX.WAIT     I-type   Freeze PC for rs1 clock cycles
+//   001     LX.REPORT   I-type   Initiate DMA transfer of 8-byte HID report
+//                                from the buffer at address rs1
+//
+// Encoding notes
+// ──────────────
+// LX.SENSOR / LX.MATRIX / LX.DELTA:
+//   Standard I-type.  imm12 is reserved and always encoded as zero; it is
+//   NOT exposed as an assembler operand to prevent mis-use.  Only rd and rs1
+//   appear in the assembly syntax.
+//
+// LX.CHORD:
+//   R-type with rs2=0 and funct7=0 (both reserved).  Only rs1 (the bitmask)
+//   and rd (the match result) are meaningful.
+//
+// LX.WAIT:
+//   Standard I-type without a destination: rs1 (bits[19:15]) carries the
+//   stall duration.  rd and imm12 are zero.  The assembler syntax is:
+//     lx.wait rs1     (rs1 is read; no register is written)
+//
+// LX.REPORT:
+//   Standard I-type without a destination.  rs1 carries the pointer to the
+//   8-byte HID report buffer.  rd and imm12 are zero.  This instruction
+//   initiates a DMA write to the USB endpoint (mayStore = 1).
+//===----------------------------------------------------------------------===//
+
+// CUSTOM-0: sensor reads.
+//   hasSideEffects = 1  — each read queries hardware state outside the IR model.
+//   mayLoad = 1         — values originate from the sensor controller's BRAM.
+//   mayStore = 0        — no memory side-effects.
+let hasSideEffects = 1, mayLoad = 1, mayStore = 0 in {
+
+  // LX.SENSOR rd, rs1
+  //   rd ← sign_extend_16(sensor_controller.snapshot[rs1 & 0x3F])
+  def LX_SENSOR : LXInstI<0b000, OPC_CUSTOM_0,
+                           (outs GPR:$rd), (ins GPR:$rs1),
+                           "lx.sensor", "$rd, $rs1"> {
+    let imm12 = 0; // reserved; must be zero
+  }
+
+  // LX.MATRIX rd, rs1
+  //   rd ← base address of the stable double-buffer snapshot (rs1 ignored).
+  def LX_MATRIX : LXInstI<0b001, OPC_CUSTOM_0,
+                           (outs GPR:$rd), (ins GPR:$rs1),
+                           "lx.matrix", "$rd, $rs1"> {
+    let imm12 = 0; // reserved; must be zero
+  }
+
+  // LX.DELTA rd, rs1
+  //   rd ← sign_extend_16(current_frame[rs1] - prev_frame[rs1])
+  def LX_DELTA  : LXInstI<0b010, OPC_CUSTOM_0,
+                           (outs GPR:$rd), (ins GPR:$rs1),
+                           "lx.delta", "$rd, $rs1"> {
+    let imm12 = 0; // reserved; must be zero
+  }
+
+  // LX.CHORD rd, rs1
+  //   rd ← ((active_key_register & rs1) == rs1) ? 1 : 0
+  //   R-type: rs2 and funct7 are reserved and encoded as zero.
+  def LX_CHORD  : LXInstRBase<0b011, OPC_CUSTOM_0,
+                               (outs GPR:$rd), (ins GPR:$rs1),
+                               "lx.chord", "$rd, $rs1"> {
+    let Inst{31-25} = 0b0000000; // funct7 = 0 (reserved)
+    let rs2         = 0;         // rs2 = x0 (reserved)
+  }
+
+} // hasSideEffects = 1, mayLoad = 1, mayStore = 0
+
+// CUSTOM-1: pipeline control and DMA.
+//   hasSideEffects = 1  — both instructions affect observable state outside
+//                         the pure data-flow graph.
+//   mayLoad = 0         — neither instruction reads from the data memory.
+let hasSideEffects = 1, mayLoad = 0 in {
+
+  // LX.WAIT rs1
+  //   Freeze the program counter for the number of cycles contained in rs1.
+  //   Total latency impact is 1 issue cycle + N stall cycles = N+1 clocks
+  //   before the next instruction executes.
+  //
+  //   ENCODING NOTE: rs1 (bits[19:15]) carries the cycle count; rd is reserved.
+  let mayStore = 0 in
+  def LX_WAIT   : LXInstI<0b000, OPC_CUSTOM_1,
+                           (outs), (ins GPR:$rs1),
+                           "lx.wait", "$rs1"> {
+    let rd    = 0; // reserved; must be zero
+    let imm12 = 0; // reserved; must be zero
+  }
+
+  // LX.REPORT rs1
+  //   Kick the DMA engine to transfer 8 bytes from *rs1 to the USB endpoint.
+  //   Non-blocking from the CPU perspective unless the DMA is already busy
+  //   (hardware inserts stall cycles in that case).
+  //   rd and imm12 are zero.
+  let mayStore = 1 in
+  def LX_REPORT : LXInstI<0b001, OPC_CUSTOM_1,
+                           (outs), (ins GPR:$rs1),
+                           "lx.report", "$rs1"> {
+    let rd    = 0; // reserved; must be zero
+    let imm12 = 0; // reserved; must be zero
+  }
+
+} // hasSideEffects = 1, mayLoad = 0
+
+//-----------------------------------------------------------------------
+// SelectionDAG → MachineInstr patterns for PULSAR custom nodes.
+//
+// Each LX32ISD node (emitted by lowerINTRINSIC in LX32ISelLowering.cpp)
+// maps to exactly one machine instruction.  Variable names reflect the
+// semantic role of each operand:
+//   $idx  — sensor index (0-63)
+//   $col  — column selector (unused by LX.MATRIX; present for ISA uniformity)
+//   $key  — sensor index for delta computation
+//   $mask — 32-bit active-key bitmask for chord detection
+//   $n    — number of stall cycles for LX.WAIT
+//   $ptr  — pointer to the 8-byte HID report buffer for LX.REPORT
+//-----------------------------------------------------------------------
+def : Pat<(LX32sensor GPR:$idx),  (LX_SENSOR GPR:$idx)>;
+def : Pat<(LX32matrix GPR:$col),  (LX_MATRIX GPR:$col)>;
+def : Pat<(LX32delta  GPR:$key),  (LX_DELTA  GPR:$key)>;
+def : Pat<(LX32chord  GPR:$mask), (LX_CHORD  GPR:$mask)>;
+def : Pat<(LX32wait   GPR:$n),    (LX_WAIT   GPR:$n)>;
+def : Pat<(LX32report GPR:$ptr),  (LX_REPORT GPR:$ptr)>;
