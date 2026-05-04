@@ -12,11 +12,12 @@
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/EndianStream.h"
 #include "llvm/Support/Endian.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
 #define GET_INSTRINFO_ENUM
-#include "../TableGen/LX32GenInstrInfo.inc"
+#include "LX32GenInstrInfo.inc"
 
 #define DEBUG_TYPE "mccodeemitter"
 
@@ -53,7 +54,8 @@ public:
     const MCOperand &MO = MI.getOperand(OpNo);
     if (MO.isExpr()) {
       Fixups.push_back(MCFixup::create(0, MO.getExpr(),
-                                       (MCFixupKind)1));
+                                       (MCFixupKind)LX32Fixups::fixup_lx32_branch,
+                                       /*PCRel=*/true));
       return 0;
     }
     return getMachineOpValue(MI, MO, Fixups, STI);
@@ -65,7 +67,8 @@ public:
     const MCOperand &MO = MI.getOperand(OpNo);
     if (MO.isExpr()) {
       Fixups.push_back(MCFixup::create(0, MO.getExpr(),
-                                       (MCFixupKind)2));
+                                       (MCFixupKind)LX32Fixups::fixup_lx32_jump,
+                                       /*PCRel=*/true));
       return 0;
     }
     return getMachineOpValue(MI, MO, Fixups, STI);
@@ -81,6 +84,9 @@ MCCodeEmitter *llvm::createLX32MCCodeEmitter(const MCInstrInfo &MCII,
 void LX32MCCodeEmitter::encodeInstruction(const MCInst &MI, SmallVectorImpl<char> &CB,
                                           SmallVectorImpl<MCFixup> &Fixups,
                                           const MCSubtargetInfo &STI) const {
+  // PseudoLA is expanded to LUI+ADDI by the AsmParser and must never reach here.
+  if (MI.getOpcode() == LX32::PseudoLA)
+    report_fatal_error("lx32: PseudoLA reached the code emitter unexpanded");
   uint64_t Bits = getBinaryCodeForInstr(MI, Fixups, STI);
   support::endian::write<uint32_t>(CB, Bits, llvm::endianness::little);
 }
@@ -95,7 +101,12 @@ unsigned LX32MCCodeEmitter::getMachineOpValue(const MCInst &MI, const MCOperand 
     return static_cast<unsigned>(MO.getImm());
 
   if (MO.isExpr()) {
-    return 0; // Expr values unhandled in dummy code emitter
+    // Choose fixup kind based on the instruction: LUI→hi20, others→lo12_i.
+    MCFixupKind Kind = (MI.getOpcode() == LX32::LUI)
+        ? (MCFixupKind)LX32Fixups::fixup_lx32_hi20
+        : (MCFixupKind)LX32Fixups::fixup_lx32_lo12_i;
+    Fixups.push_back(MCFixup::create(0, MO.getExpr(), Kind, /*PCRel=*/false));
+    return 0;
   }
   return 0;
 }
